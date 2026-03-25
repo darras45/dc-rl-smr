@@ -318,21 +318,58 @@ def water_usage_efficiency_reward(params: dict) -> float:
     return reward
 
 def default_smr_reward(params: dict) -> float:
-    """Reward for the SMR agent.
+    """Reward for the SMR agent — carbon-displacing load follower.
 
     Components
     ----------
-    R_carbon    : P_SMR_fraction * CI_norm
-                  Incentivises high output when the grid carbon intensity
-                  is high, maximising the clean-energy displacement value.
-    R_econ      : E_export_fraction * CI_norm * w_export   (w_export = 0.5)
-                  Bonus for back-to-grid export during high-CI periods;
-                  decoupled from the battery reward to avoid credit
-                  assignment conflicts.
-    R_stability : -c_wear * |a_t|   (c_wear = 0.1)
+    R_carbon    : smr_power_fraction * norm_CI
+                  Rewards high SMR output proportional to how dirty the grid
+                  is at that moment.
+
+    R_op_cost   : -c_op * smr_power_fraction   (c_op = 0.4)
+                  Continuous operational cost that scales with output power.
+                  Combined with R_carbon this gives a net signal of
+                  smr_power_fraction * (norm_CI - c_op): positive only when
+                  the grid is dirtier than ci_threshold.  The agent is
+                  indifferent between P_min and P_max at exactly
+                  norm_CI == ci_threshold (0.4); it ramps down below the
+                  threshold and up above it.
+
+    R_econ      : export_fraction * (norm_CI - ci_threshold) * w_export
+                  (ci_threshold = 0.4, w_export = 0.5)
+                  Rewards exporting to the grid when it is dirty
+                  (norm_CI > 0.4, simulating positive spot price).
+                  Penalises exporting when the grid is already clean
+                  (norm_CI < 0.4, simulating negative market pricing /
+                  renewable curtailment).  Closes the "constant-max-power"
+                  loophole: the agent cannot harvest R_econ by running
+                  flat-out during clean-grid valleys.
+
+    R_stability : -c_wear * |a_t|   (c_wear = 0.02)
                   Penalises unnecessary control-rod movements (wear).
-    R_boundary  : -5.0 if the action attempts to exceed P_max or go below P_min.
-                  Strict penalty for requesting a physically impossible ramp.
+                  With delta_ramp = 0.05 × P_max the break-even immediate
+                  signal requires norm_CI ≈ 0.8; the agent's discounted
+                  value function (gamma = 0.995) overcomes this barrier
+                  well before CI reaches that level.
+
+    R_boundary  : -5.0 if the action attempts to exceed P_max or drop
+                  below P_min.  Strict penalty for physically illegal ramps.
+
+    Coefficient design
+    ------------------
+    ci_threshold = 0.4   grid "cleanliness" crossover
+    c_op         = 0.4   equals ci_threshold so R_carbon + R_op_cost = 0
+                          at any power level when norm_CI == ci_threshold
+    w_export     = 0.5   export bonus weight (decoupled from bat reward)
+    c_wear       = 0.02  ramp-wear penalty (fixed from Phase-6 audit)
+    r_boundary   = -5.0  hard stop at physics limits
+
+    Worked examples (no exports, holding action)
+    --------------------------------------------
+    norm_CI=0.1, p_frac=1.0:  0.10 - 0.40 = -0.30  ← penalised at P_max
+    norm_CI=0.4, p_frac=1.0:  0.40 - 0.40 =  0.00  ← indifferent at threshold
+    norm_CI=0.8, p_frac=1.0:  0.80 - 0.40 = +0.40  ← rewarded at P_max
+    norm_CI=0.1, p_frac=0.2:  0.02 - 0.08 = -0.06  ← preferred over P_max on clean grid
 
     Args:
         params (dict): Must contain:
@@ -353,28 +390,34 @@ def default_smr_reward(params: dict) -> float:
     boundary_hit       = params['smr_boundary_hit']
     max_smr_kw         = params['max_smr_capacity_mw'] * 1000.0
 
+    # Threshold below which exporting is penalised (simulates negative pricing)
+    ci_threshold = 0.4
+
     # R_carbon: reward high SMR output when grid CI is high
     r_carbon = smr_power_fraction * norm_ci
 
-    # R_econ: reward back-to-grid export when CI is high
+    # R_op_cost: running cost proportional to output power.
+    # c_op == ci_threshold ensures R_carbon + R_op_cost =
+    # smr_power_fraction * (norm_CI - ci_threshold): zero at the threshold,
+    # negative below it, positive above it.
+    c_op      = 0.4
+    r_op_cost = -c_op * smr_power_fraction
+
+    # R_econ: reward/penalise back-to-grid export based on grid cleanliness.
+    # Positive when norm_CI > ci_threshold (dirty grid: displace fossil fuels).
+    # Negative when norm_CI < ci_threshold (clean grid: over-generation penalty).
     w_export        = 0.5
     export_fraction = smr_grid_export_kw / max(max_smr_kw, 1e-9)
-    r_econ          = export_fraction * norm_ci * w_export
+    r_econ          = export_fraction * (norm_ci - ci_threshold) * w_export
 
     # R_stability: penalise control-rod ramp actions (wear).
-    # c_wear must be smaller than the marginal one-step reward gain from
-    # a single ramp (≈ 0.05 * CI * 1.5 ≈ 0.037 at CI=0.5) so the agent
-    # always receives a net-positive immediate signal for ramping toward
-    # the optimal power level.  c_wear=0.1 exceeded that threshold and
-    # produced a lazy-hold policy; 0.02 keeps the penalty meaningful
-    # without masking the carbon-reward gradient.
     c_wear      = 0.02
     r_stability = -c_wear * abs(ramp_dir)
 
     # R_boundary: strict penalty for attempted illegal physics action
     r_boundary = -5.0 if boundary_hit else 0.0
 
-    total_reward = r_carbon + r_econ + r_stability + r_boundary
+    total_reward = r_carbon + r_op_cost + r_econ + r_stability + r_boundary
     return float(np.clip(total_reward, -10.0, 10.0))
 
 

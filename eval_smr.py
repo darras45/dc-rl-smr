@@ -55,7 +55,7 @@ from harl.utils.trans_tools import _t2n
 # ============================================================
 MODEL_CHECKPOINT_DIR = (
     "./results/sustaindc/ny/happo/smr_4agent/"
-    "seed-00001-2026-03-25-13-31-57/models"
+    "seed-00001-2026-03-25-14-22-00/models"
 )
 # ============================================================
 
