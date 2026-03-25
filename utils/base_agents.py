@@ -16,16 +16,16 @@ class BaseLoadShiftingAgent:
         self.do_nothing_action_value = 1
         # Add a warning message to inform the user to check if the do nothing action is the '1' action.
         print(f"Warning: Please check if the do nothing action for Load Shifting Agent is the '{self.do_nothing_action_value}' action.")
-        
+
     def do_nothing_action(self):
         """
         Return the do nothing action.
-        
+
         Returns:
             action (int): The action (do nothing) to be taken.
         """
         return self.do_nothing_action_value
-    
+
 class BaseHVACAgent:
     """
     Base class for HVAC agents.
@@ -47,11 +47,11 @@ class BaseHVACAgent:
         self.do_nothing_action_value = np.int64(1)
         # Add a warning message to inform the user to check if the do nothing action is the '1' action.
         print(f"Warning: Please check if the do nothing action for HVAC is the '{self.do_nothing_action_value}' action.")
-        
+
     def do_nothing_action(self):
         """
         Return the do nothing action.
-        
+
         Returns:
             action (int): The action (do nothing) to be taken.
         """
@@ -73,16 +73,16 @@ class BaseBatteryAgent:
         self.do_nothing_action_value = 2
         # Add a warning message to inform the user to check if the do nothing action is the '1' action.
         print(f"Warning: Please check if the do nothing action for Battery is the '{self.do_nothing_action_value}' action.")
-        
+
     def do_nothing_action(self):
         """
         Return the do nothing action.
-        
+
         Returns:
             action (int): The action (do nothing) to be taken.
         """
         return self.do_nothing_action_value
-    
+
     def act(self, *args, **kwargs):
         """
         Return the do nothing action regardless of the input parameters.
@@ -95,3 +95,27 @@ class BaseBatteryAgent:
             action (int): The action (do nothing) to be taken.
         """
         return self.do_nothing_action()
+
+
+class BaseSMRAgent:
+    """Hold-power base controller for the SMR agent (action=1, no ramp).
+
+    Used when agent_smr is not included in the active training agents.
+    The reactor holds its current output level every step.
+
+    Args:
+        parameters (dict): Dictionary containing the agent parameters.
+    """
+
+    def __init__(self, parameters=None):
+        self.parameters = parameters
+        self.do_nothing_action_value = 1   # action index 1 → ramp direction 0 (hold)
+        print(f"Warning: Please check if the do nothing action for SMR Agent is the '{self.do_nothing_action_value}' action.")
+
+    def do_nothing_action(self):
+        """Return hold action (action index 1 = ramp direction 0).
+
+        Returns:
+            action (int): The action (do nothing) to be taken.
+        """
+        return self.do_nothing_action_value

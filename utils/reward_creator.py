@@ -317,6 +317,67 @@ def water_usage_efficiency_reward(params: dict) -> float:
     
     return reward
 
+def default_smr_reward(params: dict) -> float:
+    """Reward for the SMR agent.
+
+    Components
+    ----------
+    R_carbon    : P_SMR_fraction * CI_norm
+                  Incentivises high output when the grid carbon intensity
+                  is high, maximising the clean-energy displacement value.
+    R_econ      : E_export_fraction * CI_norm * w_export   (w_export = 0.5)
+                  Bonus for back-to-grid export during high-CI periods;
+                  decoupled from the battery reward to avoid credit
+                  assignment conflicts.
+    R_stability : -c_wear * |a_t|   (c_wear = 0.1)
+                  Penalises unnecessary control-rod movements (wear).
+    R_boundary  : -5.0 if the action attempts to exceed P_max or go below P_min.
+                  Strict penalty for requesting a physically impossible ramp.
+
+    Args:
+        params (dict): Must contain:
+            'smr_power_fraction'  – current output / P_max  in [0, 1]
+            'smr_grid_export_kW'  – excess power exported to grid (kW)
+            'smr_ramp_dir'        – ramp direction taken: {-1, 0, +1}
+            'smr_boundary_hit'    – True if action was clamped at a limit
+            'norm_CI'             – normalised carbon intensity in [0, 1]
+            'max_smr_capacity_mw' – nameplate capacity in MW
+
+    Returns:
+        float: Total SMR reward, clipped to [-10, 10].
+    """
+    norm_ci            = params['norm_CI']
+    smr_power_fraction = params['smr_power_fraction']   # [0, 1]
+    smr_grid_export_kw = params['smr_grid_export_kW']
+    ramp_dir           = params['smr_ramp_dir']         # {-1, 0, 1}
+    boundary_hit       = params['smr_boundary_hit']
+    max_smr_kw         = params['max_smr_capacity_mw'] * 1000.0
+
+    # R_carbon: reward high SMR output when grid CI is high
+    r_carbon = smr_power_fraction * norm_ci
+
+    # R_econ: reward back-to-grid export when CI is high
+    w_export        = 0.5
+    export_fraction = smr_grid_export_kw / max(max_smr_kw, 1e-9)
+    r_econ          = export_fraction * norm_ci * w_export
+
+    # R_stability: penalise control-rod ramp actions (wear).
+    # c_wear must be smaller than the marginal one-step reward gain from
+    # a single ramp (≈ 0.05 * CI * 1.5 ≈ 0.037 at CI=0.5) so the agent
+    # always receives a net-positive immediate signal for ramping toward
+    # the optimal power level.  c_wear=0.1 exceeded that threshold and
+    # produced a lazy-hold policy; 0.02 keeps the penalty meaningful
+    # without masking the carbon-reward gradient.
+    c_wear      = 0.02
+    r_stability = -c_wear * abs(ramp_dir)
+
+    # R_boundary: strict penalty for attempted illegal physics action
+    r_boundary = -5.0 if boundary_hit else 0.0
+
+    total_reward = r_carbon + r_econ + r_stability + r_boundary
+    return float(np.clip(total_reward, -10.0, 10.0))
+
+
 # Other reward methods can be added here.
 
 REWARD_METHOD_MAP = {
@@ -331,6 +392,7 @@ REWARD_METHOD_MAP = {
     'energy_PUE_reward' : energy_PUE_reward,
     'temperature_efficiency_reward' : temperature_efficiency_reward,
     'water_usage_efficiency_reward' : water_usage_efficiency_reward,
+    'default_smr_reward'           : default_smr_reward,
 }
 
 def get_reward_method(reward_method : str = 'default_dc_reward'):

@@ -11,10 +11,10 @@ import gymnasium as gym
 from gymnasium import spaces
 from utils import reward_creator
 from utils.base_agents import (BaseBatteryAgent, BaseHVACAgent,
-                               BaseLoadShiftingAgent)
+                               BaseLoadShiftingAgent, BaseSMRAgent)
 from utils.rbc_agents import RBCBatteryAgent
 from utils.make_envs_pyenv import (make_bat_fwd_env, make_dc_pyeplus_env,
-                                   make_ls_env)
+                                   make_ls_env, make_smr_env)
 from utils.managers import (CI_Manager, Time_Manager, Weather_Manager,
                             Workload_Manager)
 from utils.utils_cf import get_energy_variables, get_init_day, obtain_paths
@@ -70,6 +70,13 @@ class EnvConfig(dict):
         'ls_reward': 'default_ls_reward',
         'dc_reward': 'default_dc_reward',
         'bat_reward': 'default_bat_reward',
+        'smr_reward': 'default_smr_reward',
+
+        # Maximum SMR nameplate capacity in MW
+        'max_smr_capacity_mw': 50.0,
+
+        # Minimum allowed SMR output as a fraction of max capacity (physics floor)
+        'smr_min_power_fraction': 0.2,
 
         # Evaluation flag that is required by the load-shifting environment
         # To be set only during offline evaluation
@@ -142,6 +149,9 @@ class SustainDC(gym.Env):
         
         bat_reward_method = 'default_bat_reward' if not 'bat_reward' in env_config.keys() else env_config['bat_reward']
         self.bat_reward_method = reward_creator.get_reward_method(bat_reward_method)
+
+        smr_reward_method = 'default_smr_reward' if not 'smr_reward' in env_config.keys() else env_config['smr_reward']
+        self.smr_reward_method = reward_creator.get_reward_method(smr_reward_method)
         
         n_vars_energy, n_vars_battery = 0, 0  # For partial observability (for p.o.)
         n_vars_ci = 8
@@ -156,8 +166,16 @@ class SustainDC(gym.Env):
                                         n_fwd_steps=n_vars_ci)
 
         self.bat_env.dcload_max = self.dc_env.power_ub_kW / 4  # Assuming 15 minutes timestep. Kwh
-        
+
         self.bat_env.dcload_min = self.dc_env.power_lb_kW / 4  # Assuming 15 minutes timestep. Kwh
+
+        self.max_smr_capacity_mw = env_config['max_smr_capacity_mw']
+        self.smr_env = make_smr_env(
+            month=self.month,
+            max_smr_capacity_mw=self.max_smr_capacity_mw,
+            smr_min_power_fraction=env_config['smr_min_power_fraction'],
+            dc_load_max_kw=self.dc_env.power_ub_kW,
+        )
         
         self._obs_space_in_preferred_format = True
         
@@ -189,6 +207,12 @@ class SustainDC(gym.Env):
             self.action_space.append(self.bat_env.action_space)
         else:
             self.base_agents["agent_bat"] = BaseBatteryAgent()
+
+        if "agent_smr" in self.agents:
+            self.observation_space.append(self.smr_env.observation_space)
+            self.action_space.append(self.smr_env.action_space)
+        else:
+            self.base_agents["agent_smr"] = BaseSMRAgent()
             
         # ls_state[0:10]->10 variables
         # dc_state[4:9] & bat_state[5]->5+1 variables
@@ -433,6 +457,73 @@ class SustainDC(gym.Env):
         return bat_state
 
 
+    def _create_smr_state(self, t_i, current_workload, current_ci, ci_future, ci_past,
+                          smr_power_fraction, smr_core_temp, dc_total_power_kw,
+                          battery_soc, smr_grid_export_kw):
+        """Create the 11-D observation vector for the SMR agent.
+
+        Args:
+            t_i                 : Time encoding array (sin/cos hour from Time_Manager).
+            current_workload    : Normalised CPU workload [0, 1].
+            current_ci          : Normalised current carbon intensity.
+            ci_future           : Array of future normalised CI values.
+            ci_past             : Array of past normalised CI values (16 steps).
+            smr_power_fraction  : Current SMR output / P_max  in [0, 1].
+            smr_core_temp       : Core temperature in °C.
+            dc_total_power_kw   : DC total power demand this step (kW).
+            battery_soc         : Battery state-of-charge (normalised).
+            smr_grid_export_kw  : Power exported to grid this step (kW).
+
+        Returns:
+            np.ndarray: 11-D float32 state vector.
+        """
+        hour_sin_cos = t_i[:2]
+
+        # CI trend analysis — identical windowing to _create_bat_state
+        trend_smoothing_window = 4
+        smoothed_ci_future = np.convolve(
+            np.hstack((current_ci, ci_future[:16])),
+            np.ones(trend_smoothing_window), 'valid'
+        ) / trend_smoothing_window
+        smoothed_ci_past = np.convolve(
+            np.hstack((ci_past, current_ci)),
+            np.ones(trend_smoothing_window), 'valid'
+        ) / trend_smoothing_window
+
+        ci_future_slope = np.polyfit(range(len(smoothed_ci_future)), smoothed_ci_future, 1)[0]
+        ci_past_slope   = np.polyfit(range(len(smoothed_ci_past)),   smoothed_ci_past,   1)[0]
+
+        # SMR-specific features (all normalised to [0, 1])
+        # Core temperature: maps [T_coolant_base, T_coolant_base + delta_T_max] → [0, 1]
+        core_temp_norm = np.clip(
+            (smr_core_temp - 150.0) / 150.0, 0.0, 1.0
+        )
+
+        # DC demand normalised by peak DC power
+        dc_demand_norm = np.clip(
+            dc_total_power_kw / max(self.dc_env.power_ub_kW, 1e-9), 0.0, 1.0
+        )
+
+        # Grid export as a fraction of nameplate SMR capacity
+        grid_export_fraction = np.clip(
+            smr_grid_export_kw / max(self.max_smr_capacity_mw * 1000.0, 1e-9), 0.0, 1.0
+        )
+
+        smr_state = np.float32(np.hstack((
+            hour_sin_cos,           # [0-1]  time encoding
+            current_ci,             # [2]    current normalised CI
+            ci_future_slope,        # [3]    CI trend (future)
+            ci_past_slope,          # [4]    CI trend (past)
+            smr_power_fraction,     # [5]    P / P_max
+            core_temp_norm,         # [6]    core temperature
+            dc_demand_norm,         # [7]    DC load fraction
+            battery_soc,            # [8]    battery SoC
+            grid_export_fraction,   # [9]    grid export fraction
+            current_workload,       # [10]   CPU workload
+        )))
+        return smr_state
+
+
     def reset(self):
         """
         Reset the environment.
@@ -446,9 +537,9 @@ class SustainDC(gym.Env):
             infos (dict): Dictionary of infos.
         """
         # Reset termination and reward flags for all agents
-        self.ls_terminated = self.dc_terminated = self.bat_terminated = False
-        self.ls_truncated = self.dc_truncated = self.bat_truncated = False
-        self.ls_reward = self.dc_reward = self.bat_reward = 0
+        self.ls_terminated = self.dc_terminated = self.bat_terminated = self.smr_terminated = False
+        self.ls_truncated = self.dc_truncated = self.bat_truncated = self.smr_truncated = False
+        self.ls_reward = self.dc_reward = self.bat_reward = self.smr_reward = 0
 
         # Reset the managers
         random_init_day =  random.randint(max(0, self.ranges_day[0]), min(364, self.ranges_day[1])) # self.init_day 
@@ -471,6 +562,8 @@ class SustainDC(gym.Env):
         ls_s, self.ls_info = self.ls_env.reset()
         self.dc_state, self.dc_info = self.dc_env.reset()
         bat_s, self.bat_info = self.bat_env.reset()
+        self.smr_env.update_dc_demand(self.dc_info.get('dc_total_power_kW', 0.0))
+        smr_s, self.smr_info = self.smr_env.reset()
                 
         current_workload = self.workload_m.get_current_workload()
         next_workload = self.workload_m.get_next_workload()
@@ -493,6 +586,15 @@ class SustainDC(gym.Env):
         battery_soc = self.bat_env.get_battery_soc()
         self.bat_state = self._create_bat_state(t_i, current_workload, battery_soc, ci_i, ci_i_future, ci_i_past, current_out_temperature)
 
+        self.smr_state = self._create_smr_state(
+            t_i, current_workload, ci_i, ci_i_future, ci_i_past,
+            self.smr_info['smr_power_fraction'],
+            self.smr_info['smr_core_temp'],
+            self.dc_info.get('dc_total_power_kW', 0.0),
+            battery_soc,
+            self.smr_info['smr_grid_export_kW'],
+        )
+
         # Update ci in the battery environment
         self.bat_env.update_ci(ci_i_denorm, ci_i_future[0])
 
@@ -506,12 +608,15 @@ class SustainDC(gym.Env):
             states["agent_dc"] = self.dc_state
         if "agent_bat" in self.agents:
             states["agent_bat"] = self.bat_state
+        if "agent_smr" in self.agents:
+            states["agent_smr"] = self.smr_state
 
         # Prepare the infos dictionary with common and individual agent information
         self.infos = {
             'agent_ls': self.ls_info,
             'agent_dc': self.dc_info,
             'agent_bat': self.bat_info,
+            'agent_smr': self.smr_info,
             '__common__': {
                 'time': t_i,
                 'workload': workload,
@@ -521,7 +626,8 @@ class SustainDC(gym.Env):
                 'states': {
                     'agent_ls': self.ls_state,
                     'agent_dc': self.dc_state,
-                    'agent_bat': self.bat_state
+                    'agent_bat': self.bat_state,
+                    'agent_smr': self.smr_state,
                 }
             }
         }
@@ -581,12 +687,21 @@ class SustainDC(gym.Env):
         battery_soc = self.bat_env.get_battery_soc()
         self.bat_state = self._create_bat_state(t_i, workload, battery_soc, ci_i, ci_i_future, ci_i_past, norm_temp)
 
+        self.smr_state = self._create_smr_state(
+            t_i, workload, ci_i, ci_i_future, ci_i_past,
+            self.smr_info['smr_power_fraction'],
+            self.smr_info['smr_core_temp'],
+            self.dc_info.get('dc_total_power_kW', 0.0),
+            battery_soc,
+            self.smr_info['smr_grid_export_kW'],
+        )
+
         # Populate observation dictionary based on updated states
         obs = self._populate_observation_dict()
 
         # Calculate rewards for all agents based on the updated state
         reward_params = self._calculate_reward_params(workload, temp, ci_i, ci_i_future, day, hour, terminal)
-        self.ls_reward, self.dc_reward, self.bat_reward = self.calculate_reward(reward_params)
+        self.ls_reward, self.dc_reward, self.bat_reward, self.smr_reward = self.calculate_reward(reward_params)
 
         # Update rewards, terminations, and truncations for each agent
         self._update_reward_and_termination(rew, terminateds, truncateds)
@@ -599,6 +714,7 @@ class SustainDC(gym.Env):
             'agent_ls': self.ls_info,
             'agent_dc': self.dc_info,
             'agent_bat': self.bat_info,
+            'agent_smr': self.smr_info,
             '__common__': {
                 'time': t_i,
                 'workload': workload,
@@ -608,7 +724,8 @@ class SustainDC(gym.Env):
                 'states': {
                     'agent_ls': self.ls_state,
                     'agent_dc': self.dc_state,
-                    'agent_bat': self.bat_state
+                    'agent_bat': self.bat_state,
+                    'agent_smr': self.smr_state,
                 }
             }
         }
@@ -622,18 +739,25 @@ class SustainDC(gym.Env):
 
 
     def _perform_actions(self, action_dict):
-        """Execute actions for each agent and update their respective environments."""
-        # Load shifting agent
+        """Execute actions for each agent and update their respective environments.
+
+        Execution order:
+          1. agent_ls  — load shifting sets DC CPU workload.
+          2. agent_dc  — HVAC control; produces dc_total_power_kW.
+          3. agent_smr — reactor ramp; must run after DC so dc_demand is current.
+          4. agent_bat — battery sees net DC load after SMR contribution:
+                         net_load = max(0, dc_total_kW - smr_output_kW)
+        """
+        # --- Load shifting agent ---
         if "agent_ls" in self.agents:
             action = action_dict["agent_ls"]
         else:
             action = self.base_agents["agent_ls"].do_nothing_action()
 
-        # call step method of the load shifting environment with the action and the workload for the rest of the day
         workload_rest_day = self.workload_m.get_n_next_workloads(n=int((24 - self.current_hour) / 0.25))
         self.ls_state, _, self.ls_terminated, self.ls_truncated, self.ls_info = self.ls_env.step(action, workload_rest_day)
 
-        # Data center agent
+        # --- Data center agent ---
         if "agent_dc" in self.agents:
             action = action_dict["agent_dc"]
         else:
@@ -642,14 +766,23 @@ class SustainDC(gym.Env):
         self.dc_env.set_shifted_wklds(self.ls_info['ls_shifted_workload'])
         self.dc_state, _, self.dc_terminated, self.dc_truncated, self.dc_info = self.dc_env.step(action)
 
-        # Battery agent
+        # --- SMR agent — steps after DC so grid export is computed against current DC load ---
+        if "agent_smr" in self.agents:
+            action = action_dict["agent_smr"]
+        else:
+            action = self.base_agents["agent_smr"].do_nothing_action()
+        self.smr_env.update_dc_demand(self.dc_info['dc_total_power_kW'])
+        self.smr_state, _, self.smr_terminated, self.smr_truncated, self.smr_info = self.smr_env.step(action)
+
+        # --- Battery agent — receives net DC load after SMR offsets grid draw ---
         if "agent_bat" in self.agents:
             action = action_dict["agent_bat"]
         else:
             action = self.base_agents["agent_bat"].do_nothing_action()
             print(f'Warning, using base agent for agent_bat: {action}')
-            
-        self.bat_env.set_dcload(self.dc_info['dc_total_power_kW'] / 1e3)
+
+        net_dc_load_kw = max(0.0, self.dc_info['dc_total_power_kW'] - self.smr_info['smr_power_output_kW'])
+        self.bat_env.set_dcload(net_dc_load_kw / 1e3)
         self.bat_state, _, self.bat_terminated, self.bat_truncated, self.bat_info = self.bat_env.step(action)
 
 
@@ -670,16 +803,19 @@ class SustainDC(gym.Env):
             obs['agent_dc'] = self.dc_state
         if "agent_bat" in self.agents:
             obs['agent_bat'] = self.bat_state
+        if "agent_smr" in self.agents:
+            obs['agent_smr'] = self.smr_state
         return obs
 
 
     def _calculate_reward_params(self, workload, temp, ci_i, ci_i_future, day, hour, terminal):
         """Create the parameters needed to calculate rewards."""
         return {
-            **self.bat_info, **self.ls_info, **self.dc_info,
+            **self.bat_info, **self.ls_info, **self.dc_info, **self.smr_info,
             "outside_temp": temp, "day": day, "hour": hour,
             "norm_CI": ci_i_future[0], "forecast_CI": ci_i_future,
-            "isterminal": terminal
+            "isterminal": terminal,
+            "max_smr_capacity_mw": self.max_smr_capacity_mw,
         }
 
 
@@ -697,15 +833,21 @@ class SustainDC(gym.Env):
             rew["agent_bat"] = self.bat_reward
             terminateds["agent_bat"] = self.bat_terminated
             truncateds["agent_bat"] = self.bat_truncated
+        if "agent_smr" in self.agents:
+            rew["agent_smr"] = self.smr_reward
+            terminateds["agent_smr"] = self.smr_terminated
+            truncateds["agent_smr"] = self.smr_truncated
 
 
     def _populate_info_dict(self, reward_params):
         """Generate the info dictionary for all agents and common info."""
+        combined = {**self.dc_info, **self.ls_info, **self.bat_info, **self.smr_info, **reward_params}
         info = {
-            "agent_ls": {**self.dc_info, **self.ls_info, **self.bat_info, **reward_params},
-            "agent_dc": {**self.dc_info, **self.ls_info, **self.bat_info, **reward_params},
-            "agent_bat": {**self.dc_info, **self.ls_info, **self.bat_info, **reward_params},
-            "__common__": reward_params
+            "agent_ls":  combined,
+            "agent_dc":  combined,
+            "agent_bat": combined,
+            "agent_smr": combined,
+            "__common__": reward_params,
         }
         return info
 
@@ -731,10 +873,11 @@ class SustainDC(gym.Env):
             bat_reward (float): Individual reward for the battery agent.
         """
 
-        ls_reward = self.ls_reward_method(params)
-        dc_reward = self.dc_reward_method(params)
+        ls_reward  = self.ls_reward_method(params)
+        dc_reward  = self.dc_reward_method(params)
         bat_reward = self.bat_reward_method(params)
-        return ls_reward, dc_reward, bat_reward
+        smr_reward = self.smr_reward_method(params)
+        return ls_reward, dc_reward, bat_reward, smr_reward
         
     def close(self):
         """

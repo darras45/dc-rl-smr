@@ -72,6 +72,41 @@ def make_bat_fwd_env(month,
     bat_env = battery_env_fwd(env_config)
     return bat_env
 
+def make_smr_env(
+    month: int = 1,
+    max_smr_capacity_mw: float = 50.0,
+    smr_min_power_fraction: float = 0.2,
+    smr_ramp_rate_fraction: float = 0.05,
+    dc_load_max_kw: float = 7230.0,
+    init_power_fraction: float = 0.8,
+):
+    """Create the Small Modular Reactor environment.
+
+    Args:
+        month (int): Month of year (unused; kept for API consistency with
+            other factory functions).
+        max_smr_capacity_mw (float): Nameplate SMR capacity in MW.
+        smr_min_power_fraction (float): Minimum allowed output as a fraction
+            of max capacity — the physics floor (e.g. 0.2 for 20 %).
+        smr_ramp_rate_fraction (float): Maximum MW change per 15-min timestep
+            as a fraction of max capacity (e.g. 0.05 for 5 % per step).
+        dc_load_max_kw (float): Peak DC load in kW, used for obs normalization.
+        init_power_fraction (float): Starting power level as a fraction of max.
+
+    Returns:
+        SMREnv: Small Modular Reactor environment instance.
+    """
+    from envs.smr_env import SMREnv
+    env_config = {
+        'max_smr_capacity_mw':    max_smr_capacity_mw,
+        'smr_min_power_fraction':  smr_min_power_fraction,
+        'smr_ramp_rate_fraction':  smr_ramp_rate_fraction,
+        'dc_load_max_kw':          dc_load_max_kw,
+        'init_power_fraction':     init_power_fraction,
+    }
+    return SMREnv(env_config)
+
+
 def make_dc_pyeplus_env(month : int = 1,
                         location : str = 'NYIS',
                         dc_config_file: str = 'dc_config_file.json',
