@@ -83,7 +83,12 @@ class EnvConfig(dict):
         'evaluation': False,
 
         # Set this to True if an agent (like MADDPG) returns continuous actions,
-        "actions_are_logits": False
+        "actions_are_logits": False,
+
+        # When False, the SMR physics step is bypassed entirely: the reactor
+        # contributes zero power and the battery/grid see the full DC load.
+        # Use this to produce a clean No-SMR baseline for comparison.
+        'use_smr': True,
     }
 
     def __init__(self, raw_config):
@@ -227,6 +232,7 @@ class SustainDC(gym.Env):
 
         # This actions_are_logits is True only for MADDPG if continuous actions is used on the algorithm.
         self.actions_are_logits = env_config.get("actions_are_logits", False)
+        self.use_smr = env_config.get("use_smr", True)
         
         # # Plots for the rendering
         # # Load and scale icons for the visualization using Matplotlib
@@ -564,6 +570,15 @@ class SustainDC(gym.Env):
         bat_s, self.bat_info = self.bat_env.reset()
         self.smr_env.update_dc_demand(self.dc_info.get('dc_total_power_kW', 0.0))
         smr_s, self.smr_info = self.smr_env.reset()
+        if not self.use_smr:
+            self.smr_info = {
+                'smr_power_output_kW': 0.0,
+                'smr_power_fraction':  0.0,
+                'smr_core_temp':       150.0,
+                'smr_grid_export_kW':  0.0,
+                'smr_ramp_dir':        0,
+                'smr_boundary_hit':    False,
+            }
                 
         current_workload = self.workload_m.get_current_workload()
         next_workload = self.workload_m.get_next_workload()
@@ -767,12 +782,25 @@ class SustainDC(gym.Env):
         self.dc_state, _, self.dc_terminated, self.dc_truncated, self.dc_info = self.dc_env.step(action)
 
         # --- SMR agent — steps after DC so grid export is computed against current DC load ---
-        if "agent_smr" in self.agents:
-            action = action_dict["agent_smr"]
+        if self.use_smr:
+            if "agent_smr" in self.agents:
+                action = action_dict["agent_smr"]
+            else:
+                action = self.base_agents["agent_smr"].do_nothing_action()
+            self.smr_env.update_dc_demand(self.dc_info['dc_total_power_kW'])
+            self.smr_state, _, self.smr_terminated, self.smr_truncated, self.smr_info = self.smr_env.step(action)
+            net_dc_load_kw = max(0.0, self.dc_info['dc_total_power_kW'] - self.smr_info['smr_power_output_kW'])
         else:
-            action = self.base_agents["agent_smr"].do_nothing_action()
-        self.smr_env.update_dc_demand(self.dc_info['dc_total_power_kW'])
-        self.smr_state, _, self.smr_terminated, self.smr_truncated, self.smr_info = self.smr_env.step(action)
+            # No-SMR mode: reactor is fully bypassed; battery and grid see the full DC load.
+            self.smr_info = {
+                'smr_power_output_kW': 0.0,
+                'smr_power_fraction':  0.0,
+                'smr_core_temp':       150.0,
+                'smr_grid_export_kW':  0.0,
+                'smr_ramp_dir':        0,
+                'smr_boundary_hit':    False,
+            }
+            net_dc_load_kw = self.dc_info['dc_total_power_kW']
 
         # --- Battery agent — receives net DC load after SMR offsets grid draw ---
         if "agent_bat" in self.agents:
@@ -780,8 +808,6 @@ class SustainDC(gym.Env):
         else:
             action = self.base_agents["agent_bat"].do_nothing_action()
             print(f'Warning, using base agent for agent_bat: {action}')
-
-        net_dc_load_kw = max(0.0, self.dc_info['dc_total_power_kW'] - self.smr_info['smr_power_output_kW'])
         self.bat_env.set_dcload(net_dc_load_kw / 1e3)
         self.bat_state, _, self.bat_terminated, self.bat_truncated, self.bat_info = self.bat_env.step(action)
 
