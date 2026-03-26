@@ -293,8 +293,9 @@ def main():
 
         # --- Environment: activate all four agents ---
         env_args["agents"] = ["agent_ls", "agent_dc", "agent_bat", "agent_smr"]
+        env_args["datacenter_capacity_mw"]  = 5
         env_args["smr_reward"]             = "default_smr_reward"
-        env_args["max_smr_capacity_mw"]    = 50.0
+        env_args["max_smr_capacity_mw"]    = 6.0
         env_args["smr_min_power_fraction"] = 0.2
         env_args["month"]                  = 0          # January; runner will rotate months
         env_args["days_per_episode"]       = 7

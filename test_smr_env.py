@@ -25,10 +25,10 @@ env_config = {
     "cintensity_file": "NYIS_NG_&_avgCI.csv",
     "weather_file": "USA_NY_New.York-Kennedy.epw",
     "workload_file": "Alibaba_CPU_Data_Hourly_1.csv",
-    "datacenter_capacity_mw": 1,
+    "datacenter_capacity_mw": 5,
     "max_bat_cap_Mw": 2,
     "days_per_episode": 7,
-    "max_smr_capacity_mw": 50.0,
+    "max_smr_capacity_mw": 6.0,
     "smr_min_power_fraction": 0.2,
     "month": 0,
 }

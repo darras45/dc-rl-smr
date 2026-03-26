@@ -46,7 +46,7 @@ class EnvConfig(dict):
         'workload_file': 'Alibaba_CPU_Data_Hourly_1.csv',
         
         # Capacity (MW) of the datacenter
-        'datacenter_capacity_mw': 1,
+        'datacenter_capacity_mw': 5,
         
         # Timezone shift
         'timezone_shift': 0,
@@ -73,7 +73,7 @@ class EnvConfig(dict):
         'smr_reward': 'default_smr_reward',
 
         # Maximum SMR nameplate capacity in MW
-        'max_smr_capacity_mw': 50.0,
+        'max_smr_capacity_mw': 6.0,
 
         # Minimum allowed SMR output as a fraction of max capacity (physics floor)
         'smr_min_power_fraction': 0.2,
