@@ -160,6 +160,9 @@ tel_smr_power_mw   = []
 tel_dc_demand_mw   = []
 tel_ci_norm        = []
 tel_smr_action_int = []   # 0 / 1 / 2
+tel_smr_export_kw  = []   # raw grid export each step (kW)
+
+CI_THRESHOLD = 0.4  # must match ci_threshold in default_smr_reward
 
 step = 0
 while True:
@@ -203,11 +206,13 @@ while True:
     dc_demand_mw = info.get("dc_total_power_kW",   0.0) / 1000.0
     ci_norm      = float(info.get("norm_CI", 0.0))
     smr_action   = int(action_collector[_IDX_SMR][0, 0])
+    smr_export_kw = float(info.get("smr_grid_export_kW", 0.0))
 
     tel_smr_power_mw.append(smr_power_mw)
     tel_dc_demand_mw.append(dc_demand_mw)
     tel_ci_norm.append(ci_norm)
     tel_smr_action_int.append(smr_action)
+    tel_smr_export_kw.append(smr_export_kw)
 
     step += 1
 
@@ -230,8 +235,18 @@ smr_pw    = np.array(tel_smr_power_mw)
 dc_pw     = np.array(tel_dc_demand_mw)
 ci        = np.array(tel_ci_norm)
 actions   = np.array(tel_smr_action_int)
+export_kw = np.array(tel_smr_export_kw)
 
-export_mask = smr_pw > dc_pw             # True where SMR outpaces DC demand
+export_mask  = smr_pw > dc_pw             # True where SMR outpaces DC demand
+dirty_mask   = ci >= CI_THRESHOLD         # True where grid is "dirty"
+clean_mask   = ~dirty_mask
+
+# CI-bucketed export stats
+total_export  = export_kw.sum()
+dirty_export  = export_kw[dirty_mask].sum()
+clean_export  = export_kw[clean_mask].sum()
+dirty_frac    = dirty_export / max(total_export, 1e-9)
+clean_frac    = clean_export / max(total_export, 1e-9)
 
 print(f"Episode complete — {T} timesteps ({T * 0.25:.1f} hours)")
 print(f"  Mean SMR output   : {smr_pw.mean():.3f} MW  "
@@ -239,6 +254,11 @@ print(f"  Mean SMR output   : {smr_pw.mean():.3f} MW  "
 print(f"  Mean DC demand    : {dc_pw.mean():.3f} MW")
 print(f"  Grid export steps : {export_mask.sum()} / {T}  "
       f"({100*export_mask.mean():.1f} %)")
+print(f"  Total export      : {total_export/1e3:.2f} MWh")
+print(f"  Export on dirty grid (CI≥{CI_THRESHOLD}) : "
+      f"{dirty_export/1e3:.2f} MWh  ({100*dirty_frac:.1f} %)")
+print(f"  Export on clean grid (CI<{CI_THRESHOLD})  : "
+      f"{clean_export/1e3:.2f} MWh  ({100*clean_frac:.1f} %)")
 print(f"  Action counts     : "
       f"↓ {(actions==0).sum()}  · {(actions==1).sum()}  ↑ {(actions==2).sum()}")
 
@@ -247,8 +267,8 @@ print(f"  Action counts     : "
 # ============================================================
 
 fig, axes = plt.subplots(
-    3, 1, figsize=(14, 10), sharex=True,
-    gridspec_kw={"height_ratios": [3, 2, 1.5], "hspace": 0.08},
+    4, 1, figsize=(14, 13), sharex=True,
+    gridspec_kw={"height_ratios": [3, 2, 1.5, 2], "hspace": 0.08},
 )
 fig.suptitle(
     f"SMR Agent — Deterministic Policy Evaluation  "
@@ -311,6 +331,33 @@ ax3.set_ylabel("Action", fontsize=11)
 ax3.grid(axis="x", linestyle=":", alpha=0.5)
 ax3.set_ylim(-0.5, 2.5)
 ax3.set_title("SMR Control Actions", fontsize=10, loc="left", pad=4)
+
+# ── Pane 4: CI-bucketed grid export ──────────────────────────
+ax4 = axes[3]
+export_mw = export_kw / 1000.0
+
+# Dirty export (CI >= threshold) in red-orange, clean in teal
+ax4.fill_between(timesteps, 0, export_mw,
+                 where=dirty_mask, interpolate=True,
+                 color="#e74c3c", alpha=0.75,
+                 label=f"Export — dirty grid (CI≥{CI_THRESHOLD})")
+ax4.fill_between(timesteps, 0, export_mw,
+                 where=clean_mask, interpolate=True,
+                 color="#1abc9c", alpha=0.75,
+                 label=f"Export — clean grid (CI<{CI_THRESHOLD})")
+ax4.axhline(0, color="black", linewidth=0.6)
+ax4.set_ylabel("Export (MW)", fontsize=11)
+ax4.set_xlabel("Time (hours)", fontsize=11)
+ax4.legend(loc="upper right", fontsize=9, framealpha=0.85)
+ax4.grid(axis="y", linestyle=":", alpha=0.5)
+ax4.set_title(
+    f"Grid Export by CI Bucket — dirty {100*dirty_frac:.1f} %  /  "
+    f"clean {100*clean_frac:.1f} %",
+    fontsize=10, loc="left", pad=4,
+)
+
+# Remove x-label from pane 3 now that pane 4 has it
+axes[2].set_xlabel("")
 
 # Day-boundary vertical lines across all panes
 for d in range(1, env_args["days_per_episode"]):

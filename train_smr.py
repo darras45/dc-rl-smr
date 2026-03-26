@@ -81,7 +81,8 @@ class SMRSustainDCLogger(SustainDCLogger):
     ['agent_ls', 'agent_dc', 'agent_bat', 'agent_smr'].
     """
 
-    _SMR_AGENT_IDX = 3  # position of agent_smr in the agents list
+    _SMR_AGENT_IDX  = 3    # position of agent_smr in the agents list
+    _CI_THRESHOLD   = 0.4  # must match ci_threshold in default_smr_reward
 
     # ------------------------------------------------------------------
     # Init helpers — add SMR accumulators on top of the base dicts
@@ -94,6 +95,9 @@ class SMRSustainDCLogger(SustainDCLogger):
             "smr_power_fraction_sum":      0.0,
             "smr_grid_export_fraction_sum": 0.0,
             "smr_core_temp_sum":           0.0,
+            "smr_export_dirty_kw_sum":     0.0,  # export when CI >= threshold
+            "smr_export_clean_kw_sum":     0.0,  # export when CI <  threshold
+            "smr_export_total_kw_sum":     0.0,
         })
 
     def eval_init(self):
@@ -103,6 +107,9 @@ class SMRSustainDCLogger(SustainDCLogger):
             "smr_power_fraction_sum":      0.0,
             "smr_grid_export_fraction_sum": 0.0,
             "smr_core_temp_sum":           0.0,
+            "smr_export_dirty_kw_sum":     0.0,
+            "smr_export_clean_kw_sum":     0.0,
+            "smr_export_total_kw_sum":     0.0,
         })
 
     def eval_init_off_policy(self, total_num_steps):
@@ -112,6 +119,9 @@ class SMRSustainDCLogger(SustainDCLogger):
             "smr_power_fraction_sum":      0.0,
             "smr_grid_export_fraction_sum": 0.0,
             "smr_core_temp_sum":           0.0,
+            "smr_export_dirty_kw_sum":     0.0,
+            "smr_export_clean_kw_sum":     0.0,
+            "smr_export_total_kw_sum":     0.0,
         })
 
     # ------------------------------------------------------------------
@@ -141,6 +151,13 @@ class SMRSustainDCLogger(SustainDCLogger):
                 max_smr_kw, 1e-9
             )
             self.metrics["smr_core_temp_sum"] += step_info.get("smr_core_temp", 0.0)
+            # CI-bucketed export tracking
+            norm_ci = step_info.get("norm_CI", 0.0)
+            self.metrics["smr_export_total_kw_sum"] += export_kw
+            if norm_ci >= self._CI_THRESHOLD:
+                self.metrics["smr_export_dirty_kw_sum"] += export_kw
+            else:
+                self.metrics["smr_export_clean_kw_sum"] += export_kw
 
     # ------------------------------------------------------------------
     # eval_per_step — same accumulation during evaluation rollouts
@@ -168,6 +185,13 @@ class SMRSustainDCLogger(SustainDCLogger):
             self.eval_metrics["smr_core_temp_sum"] += step_info.get(
                 "smr_core_temp", 0.0
             )
+            # CI-bucketed export tracking
+            norm_ci = step_info.get("norm_CI", 0.0)
+            self.eval_metrics["smr_export_total_kw_sum"] += export_kw
+            if norm_ci >= self._CI_THRESHOLD:
+                self.eval_metrics["smr_export_dirty_kw_sum"] += export_kw
+            else:
+                self.eval_metrics["smr_export_clean_kw_sum"] += export_kw
 
     # ------------------------------------------------------------------
     # episode_log — write SMR scalars and print to console
@@ -181,25 +205,33 @@ class SMRSustainDCLogger(SustainDCLogger):
         avg_smr_pwr      = self.metrics["smr_power_fraction_sum"]      / n
         avg_smr_export   = self.metrics["smr_grid_export_fraction_sum"] / n
         avg_smr_temp     = self.metrics["smr_core_temp_sum"]           / n
+        total_export     = max(self.metrics["smr_export_total_kw_sum"], 1e-9)
+        dirty_export_frac = self.metrics["smr_export_dirty_kw_sum"] / total_export
+        clean_export_frac = self.metrics["smr_export_clean_kw_sum"] / total_export
 
         super().episode_log(actor_train_infos, critic_train_info, actor_buffer, critic_buffer)
 
         # --- TensorBoard ---
         self.writter.add_scalar("smr/avg_reward",
-                                avg_smr_reward,  self.total_num_steps)
+                                avg_smr_reward,   self.total_num_steps)
         self.writter.add_scalar("smr/avg_power_fraction",
-                                avg_smr_pwr,     self.total_num_steps)
+                                avg_smr_pwr,      self.total_num_steps)
         self.writter.add_scalar("smr/avg_grid_export_fraction",
-                                avg_smr_export,  self.total_num_steps)
+                                avg_smr_export,   self.total_num_steps)
         self.writter.add_scalar("smr/avg_core_temp_C",
-                                avg_smr_temp,    self.total_num_steps)
+                                avg_smr_temp,     self.total_num_steps)
+        self.writter.add_scalar("smr/export_dirty_ci_fraction",
+                                dirty_export_frac, self.total_num_steps)
+        self.writter.add_scalar("smr/export_clean_ci_fraction",
+                                clean_export_frac, self.total_num_steps)
 
         # --- Console ---
         print(
             f"  [SMR] reward={avg_smr_reward:+.4f} | "
             f"P_frac={avg_smr_pwr:.3f} | "
             f"export_frac={avg_smr_export:.3f} | "
-            f"T_core={avg_smr_temp:.1f}°C"
+            f"T_core={avg_smr_temp:.1f}°C | "
+            f"export_dirty={dirty_export_frac:.1%}  export_clean={clean_export_frac:.1%}"
         )
 
         # Restore SMR accumulators (parent reset wiped them)
@@ -208,6 +240,9 @@ class SMRSustainDCLogger(SustainDCLogger):
             "smr_power_fraction_sum":      0.0,
             "smr_grid_export_fraction_sum": 0.0,
             "smr_core_temp_sum":           0.0,
+            "smr_export_dirty_kw_sum":     0.0,
+            "smr_export_clean_kw_sum":     0.0,
+            "smr_export_total_kw_sum":     0.0,
         })
 
     # ------------------------------------------------------------------
@@ -216,27 +251,37 @@ class SMRSustainDCLogger(SustainDCLogger):
 
     def eval_log(self, eval_episode):
         n = max(self.eval_metrics["step_count"], 1)
-        avg_smr_reward = self.eval_metrics["smr_reward_sum"]              / n
-        avg_smr_pwr    = self.eval_metrics["smr_power_fraction_sum"]      / n
-        avg_smr_export = self.eval_metrics["smr_grid_export_fraction_sum"] / n
-        avg_smr_temp   = self.eval_metrics["smr_core_temp_sum"]           / n
+        avg_smr_reward   = self.eval_metrics["smr_reward_sum"]              / n
+        avg_smr_pwr      = self.eval_metrics["smr_power_fraction_sum"]      / n
+        avg_smr_export   = self.eval_metrics["smr_grid_export_fraction_sum"] / n
+        avg_smr_temp     = self.eval_metrics["smr_core_temp_sum"]           / n
+        total_export     = max(self.eval_metrics["smr_export_total_kw_sum"], 1e-9)
+        dirty_export_frac = self.eval_metrics["smr_export_dirty_kw_sum"] / total_export
+        clean_export_frac = self.eval_metrics["smr_export_clean_kw_sum"] / total_export
 
         super().eval_log(eval_episode)
 
         self.writter.add_scalar("eval_smr/avg_reward",
-                                avg_smr_reward, self.total_num_steps)
+                                avg_smr_reward,    self.total_num_steps)
         self.writter.add_scalar("eval_smr/avg_power_fraction",
-                                avg_smr_pwr,    self.total_num_steps)
+                                avg_smr_pwr,       self.total_num_steps)
         self.writter.add_scalar("eval_smr/avg_grid_export_fraction",
-                                avg_smr_export, self.total_num_steps)
+                                avg_smr_export,    self.total_num_steps)
         self.writter.add_scalar("eval_smr/avg_core_temp_C",
-                                avg_smr_temp,   self.total_num_steps)
+                                avg_smr_temp,      self.total_num_steps)
+        self.writter.add_scalar("eval_smr/export_dirty_ci_fraction",
+                                dirty_export_frac, self.total_num_steps)
+        self.writter.add_scalar("eval_smr/export_clean_ci_fraction",
+                                clean_export_frac, self.total_num_steps)
 
         self.eval_metrics.update({
             "smr_reward_sum":              0.0,
             "smr_power_fraction_sum":      0.0,
             "smr_grid_export_fraction_sum": 0.0,
             "smr_core_temp_sum":           0.0,
+            "smr_export_dirty_kw_sum":     0.0,
+            "smr_export_clean_kw_sum":     0.0,
+            "smr_export_total_kw_sum":     0.0,
         })
 
 
