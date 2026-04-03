@@ -70,7 +70,7 @@ class EnvConfig(dict):
         'ls_reward': 'default_ls_reward',
         'dc_reward': 'default_dc_reward',
         'bat_reward': 'default_bat_reward',
-        'smr_reward': 'default_smr_reward',
+        'smr_reward': 'default_smr_reward_lmp_dispatch',
 
         # Maximum SMR nameplate capacity in MW
         'max_smr_capacity_mw': 6.0,
@@ -155,11 +155,11 @@ class SustainDC(gym.Env):
         bat_reward_method = 'default_bat_reward' if not 'bat_reward' in env_config.keys() else env_config['bat_reward']
         self.bat_reward_method = reward_creator.get_reward_method(bat_reward_method)
 
-        smr_reward_method = 'default_smr_reward' if not 'smr_reward' in env_config.keys() else env_config['smr_reward']
+        smr_reward_method = 'default_smr_reward_lmp_dispatch' if not 'smr_reward' in env_config.keys() else env_config['smr_reward']
         self.smr_reward_method = reward_creator.get_reward_method(smr_reward_method)
-        self.alpha_carbon    = float(env_config.get('alpha_carbon',    0.5))
-        self.beta_revenue    = float(env_config.get('beta_revenue',    0.3))
-        self.gamma_longevity = float(env_config.get('gamma_longevity', 0.2))
+        self.alpha_carbon    = float(env_config.get('alpha_carbon',    0.4))
+        self.beta_revenue    = float(env_config.get('beta_revenue',    0.5))
+        self.gamma_longevity = float(env_config.get('gamma_longevity', 0.1))
         self.price_threshold = float(env_config.get('price_threshold', 0.5))
         
         n_vars_energy, n_vars_battery = 0, 0  # For partial observability (for p.o.)
@@ -183,6 +183,7 @@ class SustainDC(gym.Env):
             month=self.month,
             max_smr_capacity_mw=self.max_smr_capacity_mw,
             smr_min_power_fraction=env_config['smr_min_power_fraction'],
+            smr_ramp_rate_fraction=float(env_config.get('smr_ramp_rate_fraction', 0.05)),
             dc_load_max_kw=self.dc_env.power_ub_kW,
         )
         

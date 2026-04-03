@@ -373,7 +373,8 @@ def main():
         env_args["datacenter_capacity_mw"]  = 5
         env_args["smr_reward"]             = "default_smr_reward_lmp_dispatch"
         env_args["max_smr_capacity_mw"]    = 6.0
-        env_args["smr_min_power_fraction"] = 0.2
+        env_args["smr_min_power_fraction"]   = 0.2
+        env_args["smr_ramp_rate_fraction"]   = 0.10  # 0.6 MW/step → P_max→P_min in 8 steps (2 hrs)
         env_args["month"]                  = 0          # January; runner will rotate months
         env_args["days_per_episode"]       = 7
         env_args["location"]               = "ny"
