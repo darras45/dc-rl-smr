@@ -482,6 +482,82 @@ class CI_Manager():
     def get_n_past_ci(self, n):
         return self.norm_carbon[self.time_step-n:self.time_step]
 
+class Price_Manager():
+    """Manager of electricity price (LMP) data.
+
+    Mirrors CI_Manager exactly, reading hourly LMP from a CSV, interpolating
+    to 15-min resolution, and normalising over a 30-day rolling window.
+
+    Args:
+        filename (str): CSV filename inside data/ElectricityPrice/.
+        init_day (int): Initial day of the episode (0-indexed).
+        future_steps (int): Number of 15-min forecast steps. Defaults to 8.
+        timezone_shift (int): Timezone shift applied to the data.
+    """
+    def __init__(self, filename='NYIS_price_2022.csv', init_day=0,
+                 future_steps=8, timezone_shift=0):
+        price_data = pd.read_csv(
+            PATH + f"/data/ElectricityPrice/{filename}"
+        )['lmp_usd_per_mwh'].values[:8760].astype(float)
+
+        assert len(price_data) == 8760, "Price data must have 8760 hourly points."
+
+        if np.isnan(price_data).any():
+            price_data = np.nan_to_num(price_data, nan=float(np.nanmean(price_data)))
+
+        self.timestep_per_hour = 4
+        self.time_steps_day    = self.timestep_per_hour * 24
+        self.init_day          = init_day
+        self.future_steps      = future_steps
+        self.timezone_shift    = timezone_shift
+
+        x         = range(len(price_data))
+        x_new     = np.linspace(0, len(price_data), len(price_data) * self.timestep_per_hour)
+        price_smooth = np.interp(x_new, x, price_data)
+        price_smooth = np.roll(price_smooth, -timezone_shift * self.timestep_per_hour)
+
+        self.original_data = price_smooth.copy()
+        self.time_step = 0
+
+    def reset(self, init_day=None, init_hour=None):
+        self.time_step = (
+            (init_day if init_day is not None else self.init_day) * self.time_steps_day
+            + (init_hour if init_hour is not None else 0) * self.timestep_per_hour
+        )
+        self.price_smooth = self.original_data.copy()
+
+        max_30 = np.max(self.price_smooth[self.time_step: self.time_step + 30 * self.time_steps_day])
+        min_30 = np.min(self.price_smooth[self.time_step: self.time_step + 30 * self.time_steps_day])
+        denom  = max(max_30 - min_30, 1e-9)
+        self.norm_price = (self.price_smooth - min_30) / denom
+
+        self._current_norm_price   = self.norm_price[self.time_step]
+        self._forecast_norm_price  = self.norm_price[
+            (self.time_step + 1):(self.time_step + 1) + self.future_steps
+        ]
+        return self._current_norm_price, self._forecast_norm_price
+
+    def step(self):
+        self.time_step += 1
+        if self.time_step >= len(self.price_smooth):
+            self.time_step = self.init_day * self.time_steps_day
+
+        self._current_norm_price  = self.norm_price[self.time_step]
+        self._forecast_norm_price = self.norm_price[
+            (self.time_step + 1):(self.time_step + 1) + self.future_steps
+        ]
+        return self._current_norm_price, self._forecast_norm_price
+
+    def get_current_price(self):
+        return self._current_norm_price
+
+    def get_forecast_price(self):
+        return self._forecast_norm_price
+
+    def get_n_past_price(self, n):
+        return self.norm_price[self.time_step - n: self.time_step]
+
+
 # Class to manage weather data
 # Where to obtain other weather files:
 # https://climate.onebuilding.org/

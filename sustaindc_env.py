@@ -15,8 +15,8 @@ from utils.base_agents import (BaseBatteryAgent, BaseHVACAgent,
 from utils.rbc_agents import RBCBatteryAgent
 from utils.make_envs_pyenv import (make_bat_fwd_env, make_dc_pyeplus_env,
                                    make_ls_env, make_smr_env)
-from utils.managers import (CI_Manager, Time_Manager, Weather_Manager,
-                            Workload_Manager)
+from utils.managers import (CI_Manager, Price_Manager, Time_Manager,
+                            Weather_Manager, Workload_Manager)
 from utils.utils_cf import get_energy_variables, get_init_day, obtain_paths
 
 import matplotlib
@@ -138,7 +138,7 @@ class SustainDC(gym.Env):
         if hasattr(env_config, 'worker_index'):
             self.month = int((env_config.worker_index - 1) % 12)
         else:
-            self.month = env_config.get('month')
+            self.month = env_config.get('month') or 0
 
         self.evaluation_mode = env_config['evaluation']
 
@@ -157,6 +157,10 @@ class SustainDC(gym.Env):
 
         smr_reward_method = 'default_smr_reward' if not 'smr_reward' in env_config.keys() else env_config['smr_reward']
         self.smr_reward_method = reward_creator.get_reward_method(smr_reward_method)
+        self.alpha_carbon    = float(env_config.get('alpha_carbon',    0.5))
+        self.beta_revenue    = float(env_config.get('beta_revenue',    0.3))
+        self.gamma_longevity = float(env_config.get('gamma_longevity', 0.2))
+        self.price_threshold = float(env_config.get('price_threshold', 0.5))
         
         n_vars_energy, n_vars_battery = 0, 0  # For partial observability (for p.o.)
         n_vars_ci = 8
@@ -229,6 +233,10 @@ class SustainDC(gym.Env):
         self.workload_m = Workload_Manager(init_day=self.init_day, workload_filename=self.workload_file, timezone_shift=self.timezone_shift)
         self.weather_m = Weather_Manager(init_day=self.init_day, location=wea_loc, filename=self.weather_file, timezone_shift=self.timezone_shift)
         self.ci_m = CI_Manager(init_day=self.init_day, location=ci_loc, filename=self.ci_file, future_steps=n_vars_ci, timezone_shift=self.timezone_shift)
+        self.price_m = Price_Manager(init_day=self.init_day, future_steps=8, timezone_shift=self.timezone_shift)
+
+        # Track previous SMR core temperature for thermal-cycling longevity penalty
+        self.prev_smr_core_temp = 150.0
 
         # This actions_are_logits is True only for MADDPG if continuous actions is used on the algorithm.
         self.actions_are_logits = env_config.get("actions_are_logits", False)
@@ -465,8 +473,9 @@ class SustainDC(gym.Env):
 
     def _create_smr_state(self, t_i, current_workload, current_ci, ci_future, ci_past,
                           smr_power_fraction, smr_core_temp, dc_total_power_kw,
-                          battery_soc, smr_grid_export_kw):
-        """Create the 11-D observation vector for the SMR agent.
+                          battery_soc, smr_grid_export_kw,
+                          current_price, price_future, price_past):
+        """Create the 14-D observation vector for the SMR agent.
 
         Args:
             t_i                 : Time encoding array (sin/cos hour from Time_Manager).
@@ -479,9 +488,12 @@ class SustainDC(gym.Env):
             dc_total_power_kw   : DC total power demand this step (kW).
             battery_soc         : Battery state-of-charge (normalised).
             smr_grid_export_kw  : Power exported to grid this step (kW).
+            current_price       : Normalised current electricity price [0, 1].
+            price_future        : Array of future normalised price values.
+            price_past          : Array of past normalised price values (16 steps).
 
         Returns:
-            np.ndarray: 11-D float32 state vector.
+            np.ndarray: 14-D float32 state vector.
         """
         hour_sin_cos = t_i[:2]
 
@@ -498,6 +510,21 @@ class SustainDC(gym.Env):
 
         ci_future_slope = np.polyfit(range(len(smoothed_ci_future)), smoothed_ci_future, 1)[0]
         ci_past_slope   = np.polyfit(range(len(smoothed_ci_past)),   smoothed_ci_past,   1)[0]
+
+        # Price trend analysis — same windowing as CI
+        n_price_future = min(len(price_future), 16)
+        n_price_past   = min(len(price_past),   16)
+        smoothed_price_future = np.convolve(
+            np.hstack((current_price, price_future[:n_price_future])),
+            np.ones(trend_smoothing_window), 'valid'
+        ) / trend_smoothing_window
+        smoothed_price_past = np.convolve(
+            np.hstack((price_past[:n_price_past], current_price)),
+            np.ones(trend_smoothing_window), 'valid'
+        ) / trend_smoothing_window
+
+        price_future_slope = np.polyfit(range(len(smoothed_price_future)), smoothed_price_future, 1)[0]
+        price_past_slope   = np.polyfit(range(len(smoothed_price_past)),   smoothed_price_past,   1)[0]
 
         # SMR-specific features (all normalised to [0, 1])
         # Core temperature: maps [T_coolant_base, T_coolant_base + delta_T_max] → [0, 1]
@@ -526,6 +553,9 @@ class SustainDC(gym.Env):
             battery_soc,            # [8]    battery SoC
             grid_export_fraction,   # [9]    grid export fraction
             current_workload,       # [10]   CPU workload
+            current_price,          # [11]   current normalised price
+            price_future_slope,     # [12]   price trend (future)
+            price_past_slope,       # [13]   price trend (past)
         )))
         return smr_state
 
@@ -556,7 +586,8 @@ class SustainDC(gym.Env):
         workload = self.workload_m.reset(init_day=random_init_day, init_hour=random_init_hour)  # Workload manager
         temp, norm_temp, wet_bulb, norm_wet_bulb = self.weather_m.reset(init_day=random_init_day, init_hour=random_init_hour)  # Weather manager
         ci_i, ci_i_future, ci_i_denorm = self.ci_m.reset(init_day=random_init_day, init_hour=random_init_hour)  # CI manager. ci_i -> CI in the current timestep.
-        
+        price_i, price_i_future = self.price_m.reset(init_day=random_init_day, init_hour=random_init_hour)
+
         # Set the external ambient temperature to data center environment
         self.dc_env.set_ambient_temp(temp, wet_bulb)
         
@@ -579,7 +610,9 @@ class SustainDC(gym.Env):
                 'smr_ramp_dir':        0,
                 'smr_boundary_hit':    False,
             }
-                
+        self.smr_info['smr_temp_delta'] = 0.0
+        self.prev_smr_core_temp = self.smr_info['smr_core_temp']
+
         current_workload = self.workload_m.get_current_workload()
         next_workload = self.workload_m.get_next_workload()
         
@@ -601,6 +634,7 @@ class SustainDC(gym.Env):
         battery_soc = self.bat_env.get_battery_soc()
         self.bat_state = self._create_bat_state(t_i, current_workload, battery_soc, ci_i, ci_i_future, ci_i_past, current_out_temperature)
 
+        price_i_past = self.price_m.get_n_past_price(n=16)
         self.smr_state = self._create_smr_state(
             t_i, current_workload, ci_i, ci_i_future, ci_i_past,
             self.smr_info['smr_power_fraction'],
@@ -608,6 +642,7 @@ class SustainDC(gym.Env):
             self.dc_info.get('dc_total_power_kW', 0.0),
             battery_soc,
             self.smr_info['smr_grid_export_kW'],
+            price_i, price_i_future, price_i_past,
         )
 
         # Update ci in the battery environment
@@ -677,7 +712,8 @@ class SustainDC(gym.Env):
         workload = self.workload_m.step()
         temp, norm_temp, wet_bulb, norm_wet_bulb = self.weather_m.step()
         ci_i, ci_i_future, ci_i_denorm = self.ci_m.step()
-        
+        price_i, price_i_future = self.price_m.step()
+
         self.current_hour = hour
 
         # Update environment states with new values from managers
@@ -702,6 +738,7 @@ class SustainDC(gym.Env):
         battery_soc = self.bat_env.get_battery_soc()
         self.bat_state = self._create_bat_state(t_i, workload, battery_soc, ci_i, ci_i_future, ci_i_past, norm_temp)
 
+        price_i_past = self.price_m.get_n_past_price(n=16)
         self.smr_state = self._create_smr_state(
             t_i, workload, ci_i, ci_i_future, ci_i_past,
             self.smr_info['smr_power_fraction'],
@@ -709,6 +746,7 @@ class SustainDC(gym.Env):
             self.dc_info.get('dc_total_power_kW', 0.0),
             battery_soc,
             self.smr_info['smr_grid_export_kW'],
+            price_i, price_i_future, price_i_past,
         )
 
         # Populate observation dictionary based on updated states
@@ -788,7 +826,10 @@ class SustainDC(gym.Env):
             else:
                 action = self.base_agents["agent_smr"].do_nothing_action()
             self.smr_env.update_dc_demand(self.dc_info['dc_total_power_kW'])
+            prev_temp = self.prev_smr_core_temp
             self.smr_state, _, self.smr_terminated, self.smr_truncated, self.smr_info = self.smr_env.step(action)
+            self.smr_info['smr_temp_delta'] = abs(self.smr_info['smr_core_temp'] - prev_temp)
+            self.prev_smr_core_temp = self.smr_info['smr_core_temp']
             net_dc_load_kw = max(0.0, self.dc_info['dc_total_power_kW'] - self.smr_info['smr_power_output_kW'])
         else:
             # No-SMR mode: reactor is fully bypassed; battery and grid see the full DC load.
@@ -842,6 +883,12 @@ class SustainDC(gym.Env):
             "norm_CI": ci_i_future[0], "forecast_CI": ci_i_future,
             "isterminal": terminal,
             "max_smr_capacity_mw": self.max_smr_capacity_mw,
+            "norm_price": float(self.price_m.get_current_price()),
+            "smr_temp_delta": float(self.smr_info.get('smr_temp_delta', 0.0)),
+            "alpha_carbon":    self.alpha_carbon,
+            "beta_revenue":    self.beta_revenue,
+            "gamma_longevity": self.gamma_longevity,
+            "price_threshold": self.price_threshold,
         }
 
 

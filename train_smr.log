@@ -1,0 +1,13 @@
+=================================================================
+  SustainDC × SMR — HAPPO Co-Training
+=================================================================
+  Algorithm  : happo
+  Agents     : ['agent_ls', 'agent_dc', 'agent_bat', 'agent_smr']
+  SMR cap.   : 6.0 MW  |  P_min frac: 0.2
+  Device     : CUDA (GPU)
+  Rollout Ts : 4  |  episode_length: 2048  |  total steps: 50,000
+  Mini-batch : actor=16  |  critic=16
+  Logger     : SMRSustainDCLogger
+=================================================================
+
+choose to use cpu...

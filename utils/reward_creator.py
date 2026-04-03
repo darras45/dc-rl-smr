@@ -421,6 +421,206 @@ def default_smr_reward(params: dict) -> float:
     return float(np.clip(total_reward, -10.0, 10.0))
 
 
+def default_smr_reward_lmp_dispatch(params: dict) -> float:
+    """Merit-order economic dispatch reward for the SMR agent.
+
+    Structural motivation
+    ---------------------
+    Additive linear scalarization (α·R_carbon + β·R_revenue) fails for SMR
+    dispatch because carbon displacement and grid revenue are not independent
+    objectives — they jointly determine the marginal economic value of each MW
+    of SMR output.  The additive form allows the carbon term to unconditionally
+    offset the revenue penalty at every power level, creating a reward surface
+    whose gradient points toward full power regardless of grid price.
+
+    This function uses *multiplicative merit-order coupling*:
+
+        dispatch_value = α × norm_CI + β × (norm_price − θ)
+        R_dispatch     = P_frac × dispatch_value
+
+    When dispatch_value < 0 (cheap + clean grid), the agent receives a
+    negative *absolute* reward proportional to its current output.  The
+    gradient ∂R/∂P_frac = dispatch_value is directly visible at every
+    timestep — the agent does not need to integrate a deferred multi-step
+    signal to learn curtailment.  This breaks the local-optimum trap.
+
+    Components
+    ----------
+    R_dispatch (α, β):
+        P_frac × (α·norm_CI + β·(norm_price − θ))
+        Positive → run hard; negative → curtail.
+        θ (price_threshold, default 0.5) sets the dispatch crossover.
+
+    R_export (w_export = 0.3):
+        export_frac × max(0, dispatch_value) × w_export
+        Bonus for exporting to the grid *only* when dispatch_value is
+        already positive (high price AND/OR dirty grid).  Prevents the
+        agent from harvesting export bonuses during cheap hours.
+
+    R_safety (γ):
+        -γ × max(0, |ΔT|/40°C − t_safe)²
+        Soft quadratic thermal safety constraint.  Zero penalty for normal
+        load-following (|ΔT| ≤ t_safe × 40°C ≈ 12°C/step); quadratic
+        penalty only for violent transients.  Replaces the always-active
+        longevity penalty that unconditionally rewarded Always-On behaviour.
+
+    R_ramp (c_wear = 0.005):
+        -c_wear × |ramp_dir| × (1 − 0.8 × urgency)
+        Small wear penalty, reduced when |dispatch_value| is large
+        (i.e. when economics clearly justify the ramp move).
+        c_wear intentionally small (0.005) to avoid blocking economically
+        justified ramps — reactor O&M cost is ~$5/MWh vs LMP $40–100/MWh.
+
+    R_boundary:
+        -5.0 for attempted physics violation (P < P_min or P > P_max).
+
+    Weight design
+    -------------
+    Default (α=0.4, β=0.5, γ=0.1, θ=0.5):
+
+        Condition              dispatch_value   Signal
+        ──────────────────── ────────────────  ──────────
+        Mean  (CI=0.35,p=0.37)   +0.075        Run (✓)
+        Cheap (CI=0.25,p=0.20)   −0.050        Curtail (✓)
+        Peak  (CI=0.70,p=0.75)   +0.405        Max power (✓)
+
+    Args:
+        params (dict): Must contain:
+            smr_power_fraction, smr_grid_export_kW, smr_ramp_dir,
+            smr_boundary_hit, norm_CI, norm_price, smr_temp_delta,
+            max_smr_capacity_mw.
+            Optional: alpha_carbon (0.4), beta_revenue (0.5),
+            gamma_longevity (0.1), price_threshold (0.5).
+
+    Returns:
+        float: Total reward clipped to [−10, 10].
+    """
+    norm_ci            = params['norm_CI']
+    norm_price         = params.get('norm_price', norm_ci)
+    smr_power_fraction = params['smr_power_fraction']
+    smr_grid_export_kw = params['smr_grid_export_kW']
+    ramp_dir           = params['smr_ramp_dir']
+    boundary_hit       = params['smr_boundary_hit']
+    max_smr_kw         = params['max_smr_capacity_mw'] * 1000.0
+    temp_delta         = params.get('smr_temp_delta', 0.0)
+
+    alpha = params.get('alpha_carbon',    0.4)
+    beta  = params.get('beta_revenue',    0.5)
+    gamma = params.get('gamma_longevity', 0.1)
+    theta = params.get('price_threshold', 0.5)   # dispatch crossover point
+
+    # 1. Merit-order dispatch: positive when grid needs the MW, negative when not
+    dispatch_value = alpha * norm_ci + beta * (norm_price - theta)
+    r_dispatch     = smr_power_fraction * dispatch_value
+
+    # 2. Export quality bonus — only earned when dispatch_value > 0
+    w_export        = 0.3
+    export_fraction = smr_grid_export_kw / max(max_smr_kw, 1e-9)
+    r_export        = export_fraction * max(0.0, dispatch_value) * w_export
+
+    # 3. Soft thermal safety constraint — quadratic only above safe threshold
+    #    t_safe = 0.3 ≡ 12 °C per 15-min step (≈ normal slow ramp rate)
+    temp_delta_norm = float(np.clip(temp_delta / 40.0, 0.0, 1.0))
+    t_safe          = 0.3
+    excess          = max(0.0, temp_delta_norm - t_safe)
+    r_safety        = -gamma * excess ** 2
+
+    # 4. Context-adaptive ramp wear — discounted when economics justify the move
+    c_wear  = 0.005
+    urgency = float(np.clip(abs(dispatch_value) / 0.3, 0.0, 1.0))
+    r_ramp  = -c_wear * abs(ramp_dir) * (1.0 - 0.8 * urgency)
+
+    # 5. Physics boundary violation
+    r_boundary = -5.0 if boundary_hit else 0.0
+
+    total = r_dispatch + r_export + r_safety + r_ramp + r_boundary
+    return float(np.clip(total, -10.0, 10.0))
+
+
+def default_smr_reward_multiobjective(params: dict) -> float:
+    """Multi-objective SMR reward: carbon displacement + grid revenue + reactor longevity.
+
+    The SMR is a committed cost (sunk capital), so the goal is to maximise
+    value from every MWh it generates rather than deciding whether to run.
+
+    Components
+    ----------
+    R_carbon    (α):  smr_power_fraction × norm_CI
+                      Reward high output when the grid is dirty — each MWh
+                      from the SMR displaces a fossil-fuel MWh.
+
+    R_revenue   (β):  export_fraction × (norm_price − 0.5)
+                      Centred at the midpoint of the normalised price range.
+                      Positive when price is above average (reward export),
+                      negative when below (penalise cheap export).  Creates
+                      a genuine dispatch tradeoff — the agent must choose
+                      *when* to export, not just export as much as possible.
+
+    R_longevity (γ):  −temp_delta_norm
+                      Penalise rate of core-temperature change (thermal
+                      fatigue).  Large ΔT per timestep accelerates material
+                      creep and shortens reactor life.  Normalised by 40 °C
+                      (≈ max realistic single-step ΔT at full ramp).
+
+    R_stability :  −c_wear × |a_t|  (c_wear = 0.02)
+                   Penalise unnecessary control-rod movements.
+
+    R_boundary  :  −5.0 if action hit P_min / P_max limit.
+
+    Weight defaults (α, β, γ) = (0.5, 0.3, 0.2) sum to 1.0; override via
+    env_config keys alpha_carbon / beta_revenue / gamma_longevity.
+
+    Args:
+        params (dict): Must contain:
+            smr_power_fraction, smr_grid_export_kW, smr_ramp_dir,
+            smr_boundary_hit, norm_CI, norm_price, smr_temp_delta,
+            max_smr_capacity_mw, alpha_carbon, beta_revenue, gamma_longevity.
+
+    Returns:
+        float: Total reward clipped to [−10, 10].
+    """
+    norm_ci            = params['norm_CI']
+    norm_price         = params.get('norm_price', norm_ci)   # fallback: use CI as proxy
+    smr_power_fraction = params['smr_power_fraction']
+    smr_grid_export_kw = params['smr_grid_export_kW']
+    ramp_dir           = params['smr_ramp_dir']
+    boundary_hit       = params['smr_boundary_hit']
+    max_smr_kw         = params['max_smr_capacity_mw'] * 1000.0
+    temp_delta         = params.get('smr_temp_delta', 0.0)
+
+    alpha = params.get('alpha_carbon',    0.5)
+    beta  = params.get('beta_revenue',    0.3)
+    gamma = params.get('gamma_longevity', 0.2)
+
+    # R_carbon: displace dirty grid generation
+    r_carbon = smr_power_fraction * norm_ci
+
+    # R_revenue: earn from high-price grid export, penalise low-price export.
+    # Centred at 0.5 so the signal is negative when price is below average
+    # and positive when above — creates a genuine dispatch incentive.
+    export_fraction = smr_grid_export_kw / max(max_smr_kw, 1e-9)
+    r_revenue = export_fraction * (norm_price - 0.5)
+
+    # R_longevity: penalise thermal cycling (fatigue)
+    # 40 °C normalisation ≈ max ΔT at full ramp in one 15-min step
+    temp_delta_norm = float(np.clip(temp_delta / 40.0, 0.0, 1.0))
+    r_longevity = -temp_delta_norm
+
+    # R_stability: penalise unnecessary control-rod ramps (wear)
+    c_wear      = 0.02
+    r_stability = -c_wear * abs(ramp_dir)
+
+    # R_boundary: hard penalty for attempted physics violation
+    r_boundary = -5.0 if boundary_hit else 0.0
+
+    total = (alpha * r_carbon
+             + beta  * r_revenue
+             + gamma * r_longevity
+             + r_stability
+             + r_boundary)
+    return float(np.clip(total, -10.0, 10.0))
+
+
 # Other reward methods can be added here.
 
 REWARD_METHOD_MAP = {
@@ -435,7 +635,9 @@ REWARD_METHOD_MAP = {
     'energy_PUE_reward' : energy_PUE_reward,
     'temperature_efficiency_reward' : temperature_efficiency_reward,
     'water_usage_efficiency_reward' : water_usage_efficiency_reward,
-    'default_smr_reward'           : default_smr_reward,
+    'default_smr_reward'                   : default_smr_reward,
+    'default_smr_reward_multiobjective'    : default_smr_reward_multiobjective,
+    'default_smr_reward_lmp_dispatch'      : default_smr_reward_lmp_dispatch,
 }
 
 def get_reward_method(reward_method : str = 'default_dc_reward'):

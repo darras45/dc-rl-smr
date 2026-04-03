@@ -21,8 +21,8 @@ class SMREnv(gym.Env):
     Notes
     -----
     The obs vector returned by step() is a zeros placeholder; the real
-    11-D observation is assembled by SustainDC._create_smr_state() using
-    shared CI/workload/temperature data from the environment managers.
+    14-D observation is assembled by SustainDC._create_smr_state() using
+    shared CI/workload/temperature/price data from the environment managers.
     update_dc_demand() must be called by SustainDC before each step().
     """
 
@@ -44,10 +44,11 @@ class SMREnv(gym.Env):
         self.dc_load_max_kw = float(env_config.get('dc_load_max_kw', self.max_power_mw * 1000.0))
 
         self.action_space = spaces.Discrete(3)
-        # Shape must match the 11-D vector produced by SustainDC._create_smr_state
+        # Shape must match the 14-D vector produced by SustainDC._create_smr_state
+        # Dims [11-13] add normalised electricity price and its future/past trend slopes.
         self.observation_space = spaces.Box(
-            low=np.float32(-1.0 * np.ones(11)),
-            high=np.float32(np.ones(11)),
+            low=np.float32(-1.0 * np.ones(14)),
+            high=np.float32(np.ones(14)),
         )
 
         init_frac             = float(env_config.get('init_power_fraction', 0.8))
@@ -90,7 +91,7 @@ class SMREnv(gym.Env):
         self.dc_demand_kw     = 0.0
         info = self._build_info(ramp_dir=0, boundary_hit=False)
         # Placeholder obs; real obs assembled by SustainDC._create_smr_state
-        return np.zeros(11, dtype=np.float32), info
+        return np.zeros(14, dtype=np.float32), info
 
     def step(self, action: int):
         """Advance reactor physics by one 15-minute timestep.
@@ -125,7 +126,7 @@ class SMREnv(gym.Env):
         self.core_temp = float(self._step_core_temp(self.current_power_mw))
 
         info = self._build_info(ramp_dir, boundary_hit)
-        return np.zeros(11, dtype=np.float32), 0.0, False, False, info
+        return np.zeros(14, dtype=np.float32), 0.0, False, False, info
 
     # ------------------------------------------------------------------
     def _build_info(self, ramp_dir: int, boundary_hit: bool) -> dict:
